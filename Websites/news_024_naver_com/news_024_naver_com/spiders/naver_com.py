@@ -5,7 +5,7 @@ import scrapy
 from scrapy import cmdline
 from scrapy.http.response.html import HtmlResponse
 from scrapy.utils.project import get_project_settings
-from .utils import get_last_month_timestamps, md5, convert_to_east_eight, is_exist, current_timestamp
+from .utils import get_last_month_timestamps, md5, convert_to_east_eight, is_exist, current_timestamp, current_datetime
 from ..items import News024NaverComItem
 settings = get_project_settings()
 
@@ -19,6 +19,9 @@ class NaverComSpider(scrapy.Spider):
         super().__init__(**kwargs)
         self.last_month_datetime = get_last_month_timestamps()
         self.redis_key = 'news_024_naver_com'
+        self.next_timestamp = None
+        self.page = None
+        self.html = None
 
     def start_requests(self):
         # world栏目
@@ -26,29 +29,32 @@ class NaverComSpider(scrapy.Spider):
         yield scrapy.Request(url=url, callback=self.parse, dont_filter=True)
 
     def parse(self, response: HtmlResponse, **kwargs):
-        if isinstance(response, HtmlResponse):
-            html = response
-            page_info = html.xpath('//div[@class="section_latest_article _CONTENT_LIST _PERSIST_META"]')
-            page = page_info.xpath('./@data-page-no').get()
-            next_timestamp = page_info.xpath('./@data-cursor').get()
-        else:
-            html_json = json.loads(response.body.decode(response.encoding))['renderedComponent']['SECTION_ARTICLE_LIST']
-            html = etree.HTML(html_json)
-            page_info = html.xpath('//div[@class="section_latest_article _CONTENT_LIST _PERSIST_META"]')[0]
-            page = page_info.xpath('./@data-page-no')[0]
-            next_timestamp = page_info.xpath('./@data-cursor')[0]
+        try:
+            if isinstance(response, HtmlResponse):
+                self.html = response
+                page_info = self.html.xpath('//div[@class="section_latest_article _CONTENT_LIST _PERSIST_META"]')
+                self.page = page_info.xpath('./@data-page-no').get()
+                self.next_timestamp = page_info.xpath('./@data-cursor').get()
+            else:
+                html_json = json.loads(response.body.decode(response.encoding))['renderedComponent']['SECTION_ARTICLE_LIST']
+                self.html = etree.HTML(html_json)
+                page_info = self.html.xpath('//div[@class="section_latest_article _CONTENT_LIST _PERSIST_META"]')[0]
+                self.page = page_info.xpath('./@data-page-no')[0]
+                self.next_timestamp = page_info.xpath('./@data-cursor')[0]
+        except Exception as e:
+            print(e, 'parse list error, retry')
 
         # 新闻列表翻页  最近一个月
         # 生产时间
-        if int(next_timestamp) > self.last_month_datetime:
-            print(self.last_month_datetime)
+        if int(self.next_timestamp) > self.last_month_datetime:
             next_page_url = ('https://news.naver.com/section/template/SECTION_ARTICLE_LIST?sid=104&sid2=&cluid='
-                             '&pageNo={0}&date=&next={1}&_={2}').format(page, next_timestamp, current_timestamp())
+                             '&pageNo={0}&date=&next={1}&_={2}').format(self.page, self.next_timestamp,
+                                                                        current_timestamp())
             if not is_exist(self.redis_key, next_page_url.rpartition('&_=')[0]):
                 yield scrapy.Request(next_page_url, callback=self.parse, dont_filter=True)
 
         # 获取新闻详情
-        news_list = html.xpath('//li[@class="sa_item _LAZY_LOADING_WRAP"]')
+        news_list = self.html.xpath('//li[@class="sa_item _LAZY_LOADING_WRAP"]')
         for news in news_list:
             new_detail_url_obj = news.xpath('.//a[@class="sa_thumb_link"]/@href')
             if not isinstance(new_detail_url_obj, scrapy.selector.unified.SelectorList):
@@ -60,21 +66,48 @@ class NaverComSpider(scrapy.Spider):
 
     def parse_new_detail(self, response: HtmlResponse):
 
-        new_html = response.xpath('//div[@id="newsct"]').getall()[0]
+        new_html = response.xpath('//div[@id="newsct"]').get()
         article = response.xpath('//article[@id="dic_area"]')
+
+        # 删除空行
+        blank_rows = response.xpath('//div[@style="display:none;"]')
+        for blank_row in blank_rows:
+            blank_row.remove()
+
         title = response.xpath('//h2[@id="title_area"]//text()').get()
         author = response.xpath('//em[@class="media_end_head_journalist_name"]/text()').get()
+        if not author:
+            # 空列表改为空字符串
+            author = ''
         img_list = article.xpath('.//img[@class="_LAZY_LOADING _LAZY_LOADING_INIT_HIDE"]/@data-src').getall()
-        # 图片描述
-        img_content = article.xpath('.//span[@style="color:#808080"]//text()').getall()
-        img_content = ' '.join(img_content)
+
         publish_time = response.xpath('.//span[@class="media_end_head_info_datestamp_time '
                                       '_ARTICLE_DATE_TIME"]/@data-date-time').get()
+        # 去除图片描述
+        img_ele_list = article.xpath('.//span[@class="end_photo_org"]/*')
+        for img_ele in img_ele_list:
+            img_ele.remove()
+
+        # 新闻简述
+        media_summary_ele_list = article.xpath('//strong[@class="media_end_summary"]')
+        media_summary_content = response.xpath('//strong[@class="media_end_summary"]/text()')
+        media_summary_content = '\n'.join(media_summary_content.getall()).strip()
+        for media_summary_ele in media_summary_ele_list:
+            media_summary_ele.remove()
         # 保留图片换行
         all_texts = article.xpath('.//text()').getall()
-        # 去除存在图片描述
-        content = ' '.join(all_texts).replace(img_content, '')
+        content = ''
+        for all_text in all_texts:
+            if not all_text.replace(' ', ''):
+                continue
+            if content:
+                content += '\n\n' + all_text.replace('\n', '').replace('\t', '').strip()
+            else:
+                content += all_text.replace('\n', '').replace('\t', '').strip()
 
+        # 若存在新闻简述 拼接进content
+        if media_summary_content:
+            content = media_summary_content + '\n\n' + content
         video_map_list = []
         video_html = response.xpath('//div[@class="_VOD_PLAYER_WRAP"]')
         if video_html:
@@ -109,8 +142,7 @@ class NaverComSpider(scrapy.Spider):
         news_item['tag'] = ''
         news_item['language'] = 'ko'
         # update_time  采集时间
-        news_item['update_time'] = current_timestamp()
-
+        news_item['update_time'] = current_datetime()
         yield news_item
 
 

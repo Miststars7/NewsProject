@@ -23,6 +23,11 @@ def is_exist(key, value):
         return False
 
 
+def current_datetime():
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return now
+
+
 def current_timestamp():
     """当前时间戳 13位"""
     return int(time.time() * 1000)
